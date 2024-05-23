@@ -7,6 +7,9 @@
 package main
 
 import (
+	"fmt"
+	"net/http"
+	_ "net/http/pprof" // Using package only for invoking initialization.
 	"os"
 	"os/signal"
 	"sync"
@@ -27,8 +30,9 @@ import (
 func main() {
 	app := cli.NewApp()
 	app.Name = "GNBSIM"
-	app.Usage = "./gnbsim"
+	app.Usage = "./gnbsim --cfg [gnbsim configuration file]"
 	app.Action = action
+	app.Flags = getCliFlags()
 
 	logger.AppLog.Infoln("App Name:", app.Name)
 
@@ -39,9 +43,13 @@ func main() {
 }
 
 func action(c *cli.Context) error {
+	cfg := c.String("cfg")
+	if cfg == "" {
+		logger.AppLog.Warnln("No configuration file provided. Using default configuration file:", factory.GNBSIM_DEFAULT_CONFIG_PATH)
+		logger.AppLog.Infoln("Application Usage:", c.App.Usage)
+		cfg = factory.GNBSIM_DEFAULT_CONFIG_PATH
+	}
 
-	// load the configuration
-	cfg := c.String("test.config")
 	if err := factory.InitConfigFactory(cfg); err != nil {
 		logger.AppLog.Errorln("Failed to initialize config factory:", err)
 		return err
@@ -50,16 +58,32 @@ func action(c *cli.Context) error {
 	config := factory.AppConfig
 
 	// Initiating a server for profiling
-	logger.SetLogLevel("Debug")
+	if config.Configuration.GoProfile.Enable {
+		go func() {
+			endpt := fmt.Sprintf(":%v", config.Configuration.GoProfile.Port)
+			fmt.Println("endpoint for profile server ", endpt)
+			err := http.ListenAndServe(endpt, nil)
+			if err != nil {
+				logger.AppLog.Errorln("Failed to start profiling server")
+			}
+		}()
+	}
+	lvl := config.Logger.LogLevel
+	logger.AppLog.Infoln("Setting log level to:", lvl)
+	logger.SetLogLevel(lvl)
 
-	// TODO: pass in the config sections for gnodeb
-	err := gnodeb.InitializeAllGnbs()
+	err := prof.InitializeAllProfiles()
+	if err != nil {
+		logger.AppLog.Errorln("Failed to initialize Profiles:", err)
+		return err
+	}
+
+	err = gnodeb.InitializeAllGnbs()
 	if err != nil {
 		logger.AppLog.Errorln("Failed to initialize gNodeBs:", err)
 		return err
 	}
 
-	// Keep this because we want to make sure we pass?
 	go ListenAndLogSummary()
 
 	var appWaitGrp sync.WaitGroup
@@ -124,6 +148,15 @@ func action(c *cli.Context) error {
 	time.Sleep(time.Second * 5)
 
 	return nil
+}
+
+func getCliFlags() []cli.Flag {
+	return []cli.Flag{
+		cli.StringFlag{
+			Name:  "cfg",
+			Usage: "GNBSIM config file",
+		},
+	}
 }
 
 // TODO : we don't keep track of how many profiles are started...
