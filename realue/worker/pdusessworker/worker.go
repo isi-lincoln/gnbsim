@@ -12,7 +12,18 @@ import (
 	realuectx "github.com/omec-project/gnbsim/realue/context"
 )
 
+var (
+	locked = false
+)
+
 func Init(pduSess *realuectx.PduSession, wg *sync.WaitGroup) {
+	if !locked {
+		locked = true
+		pduSess.Log.Infoln("calling Blah")
+		go func() {
+			Blah(pduSess)
+		}()
+	}
 	HandleEvents(pduSess)
 	wg.Done()
 }
