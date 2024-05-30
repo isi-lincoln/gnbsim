@@ -21,3 +21,11 @@ For the specific commands to run, review the demo on which ffmpeg, ffplay settin
 ## Notes
 
 `gnodeb/transport/uptransport.go` can be reverted.  The changes to the code here were to make sure that the go channels and threads were not causing the packet re-ordering, that it comes from upstream (UPF).  So going back to using golang channels is fine.
+
+
+## TCP vs UDP
+
+Currently, they are implemented separately.
+
+For udp: `cp udp_handler.go realue/worker/pdusessworker/handler.go`
+For tcp: `cp tcp_handler.go realue/worker/pdusessworker/handler.go`
