@@ -8,8 +8,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/gopacket"
@@ -23,20 +23,23 @@ import (
 )
 
 const (
-	ICMP_HEADER_LEN     int = 8
+	ICMP_HEADER_LEN int = 8
+
+	/*ipv4 package requires ipv4 header length in terms of number of bytes,
+	  however it later converts it into number of 32 bit words
+	*/
 	IPV4_MIN_HEADER_LEN int = 20
 )
 
 var (
-	LocalPort     layers.TCPPort = 0
-	clientSrcPort layers.TCPPort = 0
-	clientDstPort layers.TCPPort = 0
-	ipSrcAddr     net.IP
-	ipDstAddr     net.IP
+	//clientPort layers.TCPPort = 0
+	clientSrcPort layers.UDPPort = 0
+	clientDstPort layers.UDPPort = 0
+	ethAddr       net.IP
+	srcAddr       net.IP
+	dstAddr       net.IP
 	srcMac        net.HardwareAddr
 	dstMac        net.HardwareAddr
-	gInConn       *net.Conn
-	gOutConn      *net.Conn
 
 	device       string = "eth0"
 	snapshot_len int32  = 1024
@@ -48,72 +51,67 @@ var (
 		ComputeChecksums: true,
 		FixLengths:       true,
 	}
-	mu      sync.Mutex
-	lastPdu *realuectx.PduSession
-
-	ackMap map[uint32][]byte
 )
 
-func sendPacket(pduSess *realuectx.PduSession, packet gopacket.Packet) {
-
-	eth := &layers.Ethernet{
-		//DstMAC:       net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
-		SrcMAC: net.HardwareAddr{0x02, 0x42, 0xac, 0x1a, 0x0, 0x2},
-		DstMAC: net.HardwareAddr{0x02, 0x42, 0xac, 0x1a, 0x0, 0x2},
-		//SrcMAC:       net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
-		EthernetType: layers.EthernetTypeIPv4,
-	}
-
+func sendPacket(pduSess *realuectx.PduSession, handle *pcap.Handle, packet gopacket.Packet) {
 	ipLayer := packet.Layer(layers.LayerTypeIPv4)
-	ipp, _ := ipLayer.(*layers.IPv4)
-
-	tcpLayer := packet.Layer(layers.LayerTypeTCP)
-	tcp, _ := tcpLayer.(*layers.TCP)
-
+	//tcpLayer := packet.Layer(layers.LayerTypeTCP)
+	tcpLayer := packet.Layer(layers.LayerTypeUDP)
 	appLayer := packet.ApplicationLayer()
 
+	ipp, _ := ipLayer.(*layers.IPv4)
+	//tcp, _ := tcpLayer.(*layers.TCP)
+	tcp, _ := tcpLayer.(*layers.UDP)
+
 	buffer := gopacket.NewSerializeBuffer()
-	options := gopacket.SerializeOptions{
-		ComputeChecksums: true,
-		FixLengths:       true,
-	}
-
-	/*
-		//err := gopacket.SerializeLayers(buffer, options, eth, ipLayer)
-		err := gopacket.SerializeLayers(buffer, options, eth, ipp, tcp)
-		if err != nil {
-			panic(err)
-		}
-	*/
-
 	if appLayer != nil {
+		pduSess.Log.Infof("app data to write to wire\n")
 		gopacket.SerializeLayers(buffer, options,
-			eth,
 			ipp,
 			tcp,
 			gopacket.Payload(appLayer.Payload()),
 		)
 	} else {
+		pduSess.Log.Infof("no app data on wire\n")
 		gopacket.SerializeLayers(buffer, options,
-			eth,
 			ipp,
 			tcp,
 		)
 	}
 
-	packetData := buffer.Bytes()
+	outgoingPacket := buffer.Bytes()
 
-	handle2, err := pcap.OpenLive("eth0", 1600, true, pcap.BlockForever)
+	pduSess.Log.Infof("packet on the wire: %d\n", len(outgoingPacket))
+	err = handle.WritePacketData(outgoingPacket)
 	if err != nil {
-		panic(err)
-	}
-	defer handle2.Close()
-
-	err = handle2.WritePacketData(packetData)
-	if err != nil {
-		panic(err)
+		fmt.Errorf("Error Writing Packet")
 	}
 
+}
+
+func handleUDP(port int) {
+	conn, err := net.ListenPacket("udp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		fmt.Printf("Failed to listen %v\n", err)
+		return
+	}
+	fmt.Printf("listening on port %d\n", port)
+	for {
+		buf := make([]byte, 1500)
+		n, _, err := conn.ReadFrom(buf)
+		if err != nil {
+			fmt.Printf("Error reading udp\n")
+		}
+
+		//fmt.Printf("udp read: %s\n", string(buf[:n]))
+		fmt.Printf("udp read: %d bytes\n", n)
+	}
+}
+
+func handleFunc(w http.ResponseWriter, r *http.Request) {
+	// stall until we can do all the packet things
+	fmt.Printf("Received http request - sleeping 1 minute\n")
+	time.Sleep(60 * time.Second)
 }
 
 func getIPv4Addr() {
@@ -124,7 +122,7 @@ func getIPv4Addr() {
 	}
 
 	for _, i := range ifaces {
-		if i.Name == device {
+		if i.Name == "eth0" {
 			addrs, err := i.Addrs()
 			if err != nil {
 				fmt.Print(err)
@@ -140,9 +138,10 @@ func getIPv4Addr() {
 					ip = v.IP
 				}
 
+				// check if the address is IPv4
 				if ip.To4() != nil {
 					fmt.Println("Found IPv4 Address:", ip)
-					ipSrcAddr = ip
+					ethAddr = ip
 					return
 				}
 			}
@@ -179,181 +178,71 @@ func convertPacket(packet gopacket.Packet) (*ipv4.Header, error) {
 	return nil, fmt.Errorf("No IPv4 layer found")
 }
 
-func listenInTCP(pduSess *realuectx.PduSession, inPort int) {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", inPort))
-	if err != nil {
-		pduSess.Log.Infof("Failed to listen %v\n", err)
-		return
-	}
-
-	conn, err := ln.Accept()
-	if err != nil {
-		pduSess.Log.Infof("Failed to accept %v\n", err)
-		return
-	}
-
-	gInConn = &conn
-
-	pduSess.Log.Infof("creating inbound port on %d\n", inPort)
-
-	for {
-		buf := make([]byte, 2000)
-		n, err := conn.Read(buf)
-		if err != nil {
-			pduSess.Log.Infof("Error reading tcp: %v\n", err)
-			conn.Close()
-
-			conn, err = ln.Accept()
-			if err != nil {
-				pduSess.Log.Infof("Failed to accept %v\n", err)
-				return
-			}
-			gInConn = &conn
-			continue
-		}
-
-		if gOutConn == nil {
-			initializeOutTCP(pduSess, ipDstAddr.String(), int(clientSrcPort), int(clientDstPort))
-		}
-
-		if n > 0 {
-			data := buf[:n]
-			pduSess.Log.Infof("tcp local read: %s\n %d bytes\n", data, n)
-			handleOutTCP(data)
-		} else {
-			conn.Close()
-			(*gOutConn).Close()
-		}
-	}
-}
-
-func initializeOutTCP(pduSess *realuectx.PduSession, outHost string, outSrcPort, outDstPort int) {
-	localAddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", ipSrcAddr, outSrcPort))
-	if err != nil {
-		pduSess.Log.Errorf("faled to listen on our GTP local %v", err)
-		return
-	}
-
-	dialer := net.Dialer{
-		LocalAddr: localAddr,
-	}
-
-	conn, err := dialer.Dial("tcp", fmt.Sprintf("%s:%d", outHost, outDstPort))
-	if err != nil {
-		pduSess.Log.Errorf("Failed to listen %v\n", err)
-		return
-	}
-
-	pduSess.Log.Infof("creating outbound tcp on %d\n", outDstPort)
-
-	gOutConn = &conn
-}
-
-func handleOutTCP(data []byte) {
-	mu.Lock()
-	defer mu.Unlock()
-
-	if (*gOutConn) != nil {
-		_, err := (*gOutConn).Write(data)
-		if err != nil {
-			fmt.Errorf("Error writing 'Out' tcp\n")
-		}
-
-		//fmt.Printf("tcp copying out to remote: %s\n %d bytes\n", data[:n], n)
-	} else {
-		fmt.Errorf("gconn 'Out' connection is nil!\n")
-	}
-}
-
-func handleInTCP(data []byte) {
-	mu.Lock()
-	defer mu.Unlock()
-	if (*gInConn) != nil {
-		if data == nil {
-			(*gInConn).Close()
-		} else {
-			_, err := (*gInConn).Write(data)
-			if err != nil {
-				fmt.Errorf("Error writing 'In' tcp\n")
-			}
-		}
-
-		//fmt.Printf("tcp response to local: %s\n", data[:n])
-	} else {
-		fmt.Errorf("gconn 'In' connection is nil!\n")
-	}
-}
-
 // So this server will run on :10001 as an http server that
 // we will then have a client connect to as localhost:10001
 // then we will rewrite the ip addresses
 // recompute ip, tcp checksums
 // rewrite http data field
-func handlePacket(packet gopacket.Packet, pduSess *realuectx.PduSession, dstPort int, dstIP string) {
+func handlePacket(handle *pcap.Handle, packet gopacket.Packet, pduSess *realuectx.PduSession, port int, dst string) {
+	pduSess.Log.Infof("in handle packet\n")
+
 	ipLayer := packet.Layer(layers.LayerTypeIPv4)
 	if ipLayer == nil {
 		ipv6Layer := packet.Layer(layers.LayerTypeIPv4)
 		if ipv6Layer == nil {
+			pduSess.Log.Errorf("no ip\n")
 			return
 		} else {
+			pduSess.Log.Errorf("ipv6\n")
 			return
 		}
 	}
-	tcpLayer := packet.Layer(layers.LayerTypeTCP)
+	tcpLayer := packet.Layer(layers.LayerTypeUDP)
 	if tcpLayer == nil {
+		pduSess.Log.Errorf("no udp\n")
 		return
 	}
 
+	pduSess.Log.Infof("have layers\n")
+
 	ipp, _ := ipLayer.(*layers.IPv4)
-	tcp, _ := tcpLayer.(*layers.TCP)
+	tcp, _ := tcpLayer.(*layers.UDP)
+
+	pduSess.Log.Infof("From src ip %d to dst ip %d\n", ipp.SrcIP, ipp.DstIP)
+	pduSess.Log.Infof("From src port %d to dst port %d\n", tcp.SrcPort, tcp.DstPort)
 
 	appLayer := packet.ApplicationLayer()
 
 	// Need to forward to sdcore
-	if int(tcp.DstPort) == dstPort {
-		pduSess.Log.Errorf("handlePacket: %d\n", dstPort)
-
-		pduSess.Log.Infof("RAW: src ip %s:%d to dst ip %s:%d\n", ipp.SrcIP, tcp.SrcPort, ipp.DstIP, tcp.DstPort)
+	if int(tcp.DstPort) == port {
+		pduSess.Log.Infof("outgoing %d\n", port)
+		// Need to track the incoming source port
+		if clientSrcPort == 0 {
+			clientSrcPort = tcp.SrcPort
+			clientDstPort = tcp.DstPort
+			srcAddr = ipp.SrcIP
+			dstAddr = ipp.DstIP
+		}
 		ipp.SrcIP = pduSess.PduAddress
-		ipp.DstIP = net.ParseIP(dstIP).To4()
-		pduSess.Log.Infof("TO GTP: src ip %s:%d to dst ip %s:%d\n", ipp.SrcIP, tcp.SrcPort, ipp.DstIP, tcp.DstPort)
 
-		pduSess.Log.Infof("Send Sequence number: %v\n", tcp.Seq)
-		pduSess.Log.Infof("Send Acknoweldge number: %v\n", tcp.Ack)
-		pduSess.Log.Infof("Send SYN: %t, ACK: %t, FIN: %t, RST: %t\n", tcp.SYN, tcp.ACK, tcp.FIN, tcp.RST)
+		//ipp.DstIP = net.ParseIP(pduSess.DefaultAs).To4()
+		ipp.DstIP = net.ParseIP(dst).To4()
 
-		//ipp.Flags = layers.IPv4MoreFragments
+		if appLayer != nil {
+			pduSess.Log.Infof("Application layer/Payload found.\n")
 
-		//reset mss
-		for i := range tcp.Options {
-			if tcp.Options[i].OptionType == layers.TCPOptionKindMSS {
-				mss := (uint16(tcp.Options[i].OptionData[0]) << 8) | uint16(tcp.Options[i].OptionData[1])
-				if mss > 1000 {
-					tcp.Options[i].OptionData = []byte{0x03, 0xe8} // 0x03e8 is 1000 in hexadecimal
-				}
+			if strings.Contains(string(appLayer.Payload()), "HTTP") {
+				pduSess.Log.Infof("HTTP found!\n")
 			}
+
+			payload := string(appLayer.Payload())
+
+			payload = strings.ReplaceAll(payload, "localhost", dst)
+
+			*packet.ApplicationLayer().(*gopacket.Payload) = []byte(payload)
 		}
 
-		// because data loss / retransmits we need to track state
-		for seq, data := range ackMap {
-			pduSess.Log.Errorf("Ack %d: Map: %d\n", tcp.Ack, seq)
-			if tcp.Ack == seq {
-				pduSess.Log.Errorf("Data acknowledged %d: %s\n", seq, string(data))
-				handleInTCP(data)
-				delete(ackMap, seq)
-			}
-		}
-
-		/*
-			if !found {
-				tcp.Options = append(tcp.Options, layers.TCPOption{
-					OptionType:   layers.TCPOptionKindMSS,
-					OptionLength: 4,
-					OptionData:   []byte{byte(1000 >> 8), byte(1000 & 0xff)},
-				})
-			}
-		*/
-
+		pduSess.Log.Infof("send checksuming\n")
 		tcp.SetNetworkLayerForChecksum(ipp)
 
 		ipv4hdr, err := convertPacket(packet)
@@ -372,14 +261,6 @@ func handlePacket(packet gopacket.Packet, pduSess *realuectx.PduSession, dstPort
 
 		buffer := gopacket.NewSerializeBuffer()
 		if appLayer != nil {
-
-			payload := string(appLayer.Payload())
-			payload = strings.ReplaceAll(payload, "localhost", ipDstAddr.String())
-			payload = strings.ReplaceAll(payload, string(LocalPort), string(clientDstPort))
-			*packet.ApplicationLayer().(*gopacket.Payload) = []byte(payload)
-
-			//pduSess.Log.Warnf("App payload: %s\n", payload)
-
 			gopacket.SerializeLayers(buffer, options,
 				tcp,
 				gopacket.Payload(appLayer.Payload()),
@@ -393,64 +274,105 @@ func handlePacket(packet gopacket.Packet, pduSess *realuectx.PduSession, dstPort
 
 		payload := append(v4HdrBuf, outgoingPacket...)
 
+		pduSess.Log.Errorf("Custom packet out GnbChan")
 		userDataMsg := &common.UserDataMessage{}
 		userDataMsg.Event = common.UL_UE_DATA_TRANSFER_EVENT
 		userDataMsg.Payload = payload
 		pduSess.WriteGnbChan <- userDataMsg
 		pduSess.TxDataPktCount++
 
+	} else if tcp.DstPort == clientSrcPort {
+		pduSess.Log.Infof("incoming packet %d\n", clientSrcPort)
+		/*
+				// Need to forward back to localhost
+				tcp.DstPort = clientPort
+				ipp.SrcIP = dstAddr
+				ipp.DstIP = srcAddr
+				//eth.SrcMAC = dstMac
+				//eth.DstMAC = srcMac
+
+				if appLayer != nil {
+					pduSess.Log.Infof("Application layer/Payload found.\n")
+					pduSess.Log.Infof("%s\n", appLayer.Payload())
+
+					if strings.Contains(string(appLayer.Payload()), "HTTP") {
+						pduSess.Log.Infof("HTTP found!\n")
+					}
+
+					payload := string(appLayer.Payload())
+
+					payload = strings.ReplaceAll(payload, dst, "localhost")
+
+					//pduSess.Log.Infof("modified payload: %s\n", payload)
+					*packet.ApplicationLayer().(*gopacket.Payload) = []byte(payload)
+				}
+
+			        pduSess.Log.Infof("recv checksuming\n")
+			        tcp.SetNetworkLayerForChecksum(ipp)
+
+				sendPacket(pduSess, handle, packet)
+				return
+		*/
 	} else {
 		pduSess.Log.Warnf("unhandled packet going to %d\n", tcp.DstPort)
 		return
 	}
+
 }
 
 // main function to do our http proxy'ing
 func Blah(pduSess *realuectx.PduSession) error {
-	if lastPdu == nil {
-		lastPdu = pduSess
-	}
-	pduSess.Log.Infof("starting tcp proxy\n")
 
-	ackMap = make(map[uint32][]byte, 0)
+	pduSess.Log.Infof("starting udp proxy\n")
 
 	var dstIP = "10.10.5.2"
-	ipDstAddr = net.ParseIP(dstIP)
 
+	//UDP
+	var port = 11000
 	//TCP
-	var inPort = 10000
-	var outDstPort = 10001
-	var outSrcPort = 10002
+	//var port = 10001
 
-	clientSrcPort = layers.TCPPort(outSrcPort)
-	clientDstPort = layers.TCPPort(outDstPort)
-	LocalPort = layers.TCPPort(inPort)
-
+	// get our eth0 address that we will need to get forwarded back to
 	getIPv4Addr()
 
+	//go http.ListenAndServe(fmt.Sprintf("%s:10001", ethAddr.To4().String()), nil)
+
 	//TCP
-	go func() {
-		// Need to sleep here to make sure we can intercept these packets for the
-		// 3 way handshake
-		time.Sleep(5 * time.Second)
-		pduSess.Log.Warnf("begin listening on %d\n", outSrcPort)
-		initializeOutTCP(pduSess, dstIP, outSrcPort, outDstPort)
-	}()
+	//http.HandleFunc("/", handleFunc)
+	//go http.ListenAndServe(fmt.Sprintf("%s:%d", "localhost", port), nil)
 
-	pduSess.Log.Infof("proxy listening on %d\n", inPort)
-	go listenInTCP(pduSess, inPort)
+	go handleUDP(port)
 
-	handleLocal, err := pcap.OpenLive("any", 1600, true, pcap.BlockForever)
+	pduSess.Log.Infof("proxy listening on %d\n", port)
+
+	handle, err := pcap.OpenLive("any", 1600, true, pcap.BlockForever)
 	if err != nil {
 		pduSess.Log.Errorf("Failed to open listener: %v\n", err)
 		return err
 	}
-	defer handleLocal.Close()
-	handle = handleLocal
 
-	packetSource := gopacket.NewPacketSource(handleLocal, handle.LinkType())
+	// TCP
+	/*
+		err = handle.SetBPFFilter("tcp")
+		if err != nil {
+			pduSess.Log.Errorf("Something with tcp: %v\n", err)
+			return err
+		}
+		pduSess.Log.Infof("handle tcp\n")
+	*/
+
+	// UDP
+	err = handle.SetBPFFilter("udp")
+	if err != nil {
+		pduSess.Log.Errorf("Something with udp: %v\n", err)
+		return err
+	}
+	pduSess.Log.Infof("handling udp\n")
+
+	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	for packet := range packetSource.Packets() {
-		handlePacket(packet, pduSess, outDstPort, dstIP)
+		pduSess.Log.Infof("calling handlePacket\n")
+		handlePacket(handle, packet, pduSess, port, dstIP)
 	}
 
 	pduSess.Log.Infof("End of function oh no.\n")
@@ -513,8 +435,6 @@ func SendIcmpEchoRequest(pduSess *realuectx.PduSession) (err error) {
 
 	payload := append(v4HdrBuf, b...)
 
-	time.Sleep(1 * time.Second)
-
 	userDataMsg := &common.UserDataMessage{}
 	userDataMsg.Event = common.UL_UE_DATA_TRANSFER_EVENT
 	userDataMsg.Payload = payload
@@ -568,19 +488,33 @@ func HandleIcmpMessage(pduSess *realuectx.PduSession,
 
 func HandleIpv4Message(pduSess *realuectx.PduSession, ipv4Hdr *ipv4.Header, ipv4Pkt []byte) (err error) {
 
-	if ipv4Hdr.Protocol == 1 {
-		pduSess.Log.Println("This is an icmp packet!")
-		return nil
-	}
-	// TCP
-	if ipv4Hdr.Protocol == 6 {
+	/*
+		ip4 := layers.IPv4{
+			SrcIP:    ipv4Hdr.Src,
+			DstIP:    ipv4Hdr.Dst,
+			Checksum: ipv4Hdr.Checksum,
+			Flags:    int(ipv4Hdr.HeaderFlags),
+			Protocol: ipv4Hdr.Protocol,
+			TTL:      ipv4Hdr.TTL,
+			FragOffset: ipv4Hdr.FragOff,
+			Id:         ipv4Hdr.ID,
+			TOS:        ipv4Hdr.TOS,
+			Length:     ipv4Hdr.TotalLen,
+			IHL:        ipv4Hdr.Len/4,
+			Version:    ipv4Hdr.Version,
+		}
+	*/
+
+	// UDP
+	if ipv4Hdr.Protocol == 17 {
+
 		packet := gopacket.NewPacket(ipv4Pkt, layers.LayerTypeIPv4, gopacket.Default)
 
-		tcpLayer := packet.Layer(layers.LayerTypeTCP)
-		if tcpLayer != nil {
-			//pduSess.Log.Println("This is a TCP packet!")
+		udpLayer := packet.Layer(layers.LayerTypeUDP)
+		if udpLayer != nil {
+			pduSess.Log.Println("This is a UDP packet!")
 
-			tcp, _ := tcpLayer.(*layers.TCP)
+			udp, _ := udpLayer.(*layers.UDP)
 
 			ipLayer := packet.Layer(layers.LayerTypeIPv4)
 			if ipLayer == nil {
@@ -590,51 +524,123 @@ func HandleIpv4Message(pduSess *realuectx.PduSession, ipv4Hdr *ipv4.Header, ipv4
 
 			ipp, _ := ipLayer.(*layers.IPv4)
 
-			pduSess.Log.Errorf("HandleIPv4: %d\n", tcp.DstPort)
-			pduSess.Log.Infof("From src ip %s:%d to dst ip %s:%d\n", ipp.SrcIP, tcp.SrcPort, ipp.DstIP, tcp.DstPort)
+			appLayer := packet.ApplicationLayer()
+
+			pduSess.Log.Infof("From src ip %d to dst ip %d\n", ipp.SrcIP, ipp.DstIP)
+			pduSess.Log.Infof("From src port %d to dst port %d\n", udp.SrcPort, udp.DstPort)
 
 			// Need to forward back to localhost
-			tcp.SrcPort = clientDstPort
-			tcp.DstPort = clientSrcPort
-			ipp.SrcIP = ipDstAddr
-			ipp.DstIP = ipSrcAddr
+			udp.SrcPort = clientDstPort
+			udp.DstPort = clientSrcPort
+			ipp.SrcIP = dstAddr
+			ipp.DstIP = srcAddr
 
-			tcp.SetNetworkLayerForChecksum(ipp)
+			pduSess.Log.Infof("Updated src ip %d to dst ip %d\n", ipp.SrcIP, ipp.DstIP)
+			pduSess.Log.Infof("Updated src port %d to dst port %d\n", udp.SrcPort, udp.DstPort)
 
-			pduSess.Log.Infof("Recv Updated src ip %s:%d to dst ip %s:%d\n", ipp.SrcIP, tcp.SrcPort, ipp.DstIP, tcp.DstPort)
-			pduSess.Log.Infof("Recv Seq: %v || Ack: %v\n", tcp.Seq, tcp.Ack)
-			pduSess.Log.Infof("Recv SYN: %t, ACK: %t, FIN: %t, RST: %t\n", tcp.SYN, tcp.ACK, tcp.FIN, tcp.RST)
+			pduSess.Log.Infof("recv checksuming\n")
+			udp.SetNetworkLayerForChecksum(ipp)
 
-			appLayer := packet.ApplicationLayer()
-			if appLayer != nil {
-				payload := string(appLayer.Payload())
-				payload = strings.ReplaceAll(payload, ipDstAddr.String(), "localhost")
-				payload = strings.ReplaceAll(payload, string(clientDstPort), string(LocalPort))
-				*packet.ApplicationLayer().(*gopacket.Payload) = []byte(payload)
+			buffer := gopacket.NewSerializeBuffer()
 
-				pduSess.Log.Warnf("App payload:\n%s\n", payload)
-				pduSess.Log.Errorf("Saved to: %d\n", tcp.Seq)
-				ackMap[tcp.Seq] = appLayer.Payload()
-				pduSess.Log.Errorf("Saved to: %d\n", int(tcp.Seq)+len(appLayer.Payload()))
-				ackMap[tcp.Seq+uint32(len(appLayer.Payload()))] = appLayer.Payload()
-
+			if appLayer == nil {
+				pduSess.Log.Infof("no app data on wire\n")
+				gopacket.SerializeLayers(buffer, options,
+					ipp,
+					udp,
+				)
 			} else {
+				pduSess.Log.Infof("app data on wire: %s\n", appLayer.Payload())
+				gopacket.SerializeLayers(buffer, options,
+					ipp,
+					udp,
+					gopacket.Payload(appLayer.Payload()),
+				)
 			}
 
-			sendPacket(pduSess, packet)
+			outgoingPacket := buffer.Bytes()
 
-			if tcp.FIN {
-				handleInTCP(nil)
+			handle2, err := pcap.OpenLive("eth0", 1600, true, pcap.BlockForever)
+			if err != nil {
+				fmt.Errorf("Error Opening handle")
+				return err
+			}
+			pduSess.Log.Infof("reconstructed pkt on the wire: %d\n", len(outgoingPacket))
+			err = handle2.WritePacketData(outgoingPacket)
+			if err != nil {
+				fmt.Errorf("Error Writing Packet")
 			}
 
 		} else {
-			pduSess.Log.Errorf("Not a TCP packet\n")
+			fmt.Println("Not a UDP packet!")
 			return
 		}
 
-	} else if ipv4Hdr.Protocol == 17 {
-		pduSess.Log.Errorf("UDP not implement on recv: %d\n", ipv4Hdr.Protocol)
-		return nil
+		/*
+			ip4num2 = &layers.IPv4{}
+			udp = &layers.UDP{}
+			payload = &gopacket.Payload{}
+
+			nf := gopacket.NilDecodeFeedback
+			data := ipv4Pkt[:]
+
+			err = ip4num2.DecodeFromBytes(data, nf)
+			if err != nil {
+				pduSess.Log.Errorf("packet doesnt look right\n")
+				return err
+			}
+
+			data = ipv4num.LayerPayload()
+
+			err = udp.DecodeFromBytes(data, nf)
+			if err != nil {
+				pduSess.Log.Errorf("packet doesnt look right\n")
+				return err
+			}
+
+			data = d.LayerPayload()
+
+			err = payload.DecodeFromBytes(data, nf)
+			if err != nil {
+				pduSess.Log.Errorf("packet doesnt look right\n")
+				return err
+			}
+
+			data = d.LayerPayload()
+		*/
+	} else if ipv4Hdr.Protocol == 6 {
+		// TCP TODO
+		pduSess.Log.Errorf("TCP not implement on recv: %d\n", ipv4Hdr.Protocol)
+		/*
+				type TCP struct {
+					BaseLayer
+					SrcPort, DstPort                           TCPPort
+					Seq                                        uint32
+					Ack                                        uint32
+					DataOffset                                 uint8
+					FIN, SYN, RST, PSH, ACK, URG, ECE, CWR, NS bool
+					Window                                     uint16
+					Checksum                                   uint16
+					Urgent                                     uint16
+					sPort, dPort                               []byte
+					Options                                    []TCPOption
+					Padding                                    []byte
+					opts                                       [4]TCPOption
+					tcpipchecksum
+				}
+
+			tcp, _ := tcpLayer.(*layers.UDP)
+
+			if appLayer != nil {
+				pduSess.Log.Infof("app data to write to wire\n")
+				gopacket.SerializeLayers(buffer, options,
+					ipp,
+					tcp,
+					gopacket.Payload(appLayer.Payload()),
+				)
+
+
+		*/
 	} else {
 		pduSess.Log.Errorf("Unimplemented ipv4 protocol: %d\n", ipv4Hdr.Protocol)
 		return nil
@@ -646,13 +652,6 @@ func HandleIpv4Message(pduSess *realuectx.PduSession, ipv4Hdr *ipv4.Header, ipv4
 func HandleDlMessage(pduSess *realuectx.PduSession,
 	msg common.InterfaceMessage,
 ) (err error) {
-	if pduSess == nil {
-		pduSess = lastPdu
-		if pduSess == nil {
-			pduSess.Log.Errorf("pdu sess nil")
-			return nil
-		}
-	}
 	pduSess.Log.Traceln("Handling DL user data packet from gNb")
 
 	if msg.GetEventType() == common.LAST_DATA_PKT_EVENT {
@@ -664,7 +663,7 @@ func HandleDlMessage(pduSess *realuectx.PduSession,
 	dataMsg := msg.(*common.UserDataMessage)
 
 	if dataMsg.Qfi != nil {
-		pduSess.Log.Traceln("Received QFI value in downlink user data packet:", *dataMsg.Qfi)
+		pduSess.Log.Infoln("Received QFI value in downlink user data packet:", *dataMsg.Qfi)
 	}
 
 	ipv4Hdr, err := ipv4.ParseHeader(dataMsg.Payload)
@@ -680,11 +679,12 @@ func HandleDlMessage(pduSess *realuectx.PduSession,
 			return fmt.Errorf("failed to handle icmp message:%v", err)
 		}
 	default:
-		//pduSess.Log.Infof("Protocol: %d\n", ipv4Hdr.Protocol)
+		pduSess.Log.Infof("Protocol: %d\n", ipv4Hdr.Protocol)
 		err = HandleIpv4Message(pduSess, ipv4Hdr, dataMsg.Payload)
 		if err != nil {
 			return fmt.Errorf("failed to handle our ipv4 message:%v", err)
 		}
+		// This is our message!
 		//return fmt.Errorf("unsupported ipv4 protocol:%v", ipv4Hdr.Protocol)
 	}
 
@@ -700,11 +700,11 @@ func HandleDataPktGenRequestEvent(pduSess *realuectx.PduSession,
 	pduSess.ReqDataPktInt = cmd.UserDataPktInterval
 	pduSess.DefaultAs = cmd.DefaultAs
 	if pduSess.ReqDataPktInt == 0 {
-		time.Sleep(1 * time.Second)
 		err = SendIcmpEchoRequest(pduSess)
 		if err != nil {
 			return fmt.Errorf("failed to send icmp echo req:%v", err)
 		}
+		time.Sleep(1 * time.Second)
 	} else {
 		go func(pduSess *realuectx.PduSession) {
 			for pduSess.TxDataPktCount < pduSess.ReqDataPktCount {
@@ -719,6 +719,7 @@ func HandleDataPktGenRequestEvent(pduSess *realuectx.PduSession,
 				time.Sleep(time.Duration(pduSess.ReqDataPktInt) * time.Second)
 			}
 
+			// TODO: Here
 			msg := &common.UuMessage{}
 			msg.Event = common.DATA_PKT_GEN_SUCCESS_EVENT
 			pduSess.WriteUeChan <- msg
@@ -755,6 +756,7 @@ func HandleQuitEvent(pduSess *realuectx.PduSession,
 	if !pduSess.LastDataPktRecvd {
 		for pkt := range pduSess.ReadDlChan {
 			pduSess.Log.Infof("Received pkt from DL data packet: %s\n", pkt.GetEventType())
+			// TODO: Here
 			if pkt.GetEventType() == common.LAST_DATA_PKT_EVENT {
 				pduSess.Log.Debugln("Received last downlink data packet")
 				break

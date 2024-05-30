@@ -195,7 +195,7 @@ func DecodePduSessContainerExtHeader(pkt []uint8) (payload []uint8,
 		return nil, nil, err
 	}
 
-	logger.GtpLog.Info("PDU Session Container Extension header length:", pkt[0])
+	logger.GtpLog.Infof("PDU Session Container Extension header length: %d, packet len: %d", pkt[0], len(pkt))
 
 	// First octet is Extension Header Length
 	octetCount := pkt[0] * 4

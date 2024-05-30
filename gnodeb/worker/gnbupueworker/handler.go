@@ -60,13 +60,12 @@ func HandleDlMessage(gnbue *gnbctx.GnbUpUe, intfcMsg common.InterfaceMessage) (e
 			}
 			ueDataMsg.Qfi = new(uint8)
 			*ueDataMsg.Qfi = extHdr.Qfi
-			gnbue.Log.Infoln("Received QFI value in downlink G-PDU:", extHdr.Qfi)
+			gnbue.Log.Infoln("GNBUE: Received QFI value in downlink G-PDU:", extHdr.Qfi)
 		}
 	}
 
 	ueDataMsg.Event = common.DL_UE_DATA_TRANSFER_EVENT
 	gnbue.WriteUeChan <- ueDataMsg
-	gnbue.Log.Infoln("Sent DL user data packet to UE")
 
 	return nil
 }

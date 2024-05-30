@@ -36,6 +36,7 @@ func (dao *GnbPeerDao) GetGnbUpf(ip string) *GnbUpf {
 	dao.Log.Infoln("Fetching GnbUpf corresponding to IP:", ip)
 	val, ok := dao.gnbUpfMap.Load(ip)
 	if ok {
+		dao.Log.Infoln("Found key for:", ip)
 		return val.(*GnbUpf)
 	} else {
 		dao.Log.Warnln("key not present:", ip)

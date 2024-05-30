@@ -598,6 +598,7 @@ func ProcessPduSessResourceSetupList(gnbue *gnbctx.GnbCpUe,
 		dbParam.CommChan = gnbupue.ReadUlChan
 		dbParam.PduSess = pduSess
 		dbParamSet = append(dbParamSet, dbParam)
+		gnbue.Log.Infof("Bearer added to pdusess")
 	}
 
 	if len(nasPdus) != 0 {
@@ -608,7 +609,7 @@ func ProcessPduSessResourceSetupList(gnbue *gnbctx.GnbCpUe,
 	/* TODO: To be fixed, currently Data Bearer Setup Event may get processed
 	 * before the pdu sessions are established on the UE side
 	 */
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(1 * time.Second)
 	uemsg := common.UuMessage{}
 	uemsg.Event = common.DATA_BEARER_SETUP_REQUEST_EVENT
 	uemsg.DBParams = dbParamSet

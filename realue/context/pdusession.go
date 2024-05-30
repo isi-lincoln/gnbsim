@@ -54,6 +54,7 @@ type PduSession struct {
 func NewPduSession(realUe *RealUe, pduSessId int64) *PduSession {
 	pduSess := PduSession{}
 	pduSess.PduSessId = pduSessId
+	// TODO Here next: make channels larger
 	pduSess.ReadDlChan = make(chan common.InterfaceMessage, 10)
 	pduSess.ReadCmdChan = make(chan common.InterfaceMessage, 10)
 	pduSess.Log = realUe.Log.WithFields(logrus.Fields{

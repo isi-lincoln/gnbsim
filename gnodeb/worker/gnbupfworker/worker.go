@@ -38,6 +38,7 @@ func HandleMessage(gnbUpf *gnbctx.GnbUpf, msg common.InterfaceMessage) error {
 		gnbUpf.Log.Errorln("DecodeGTPv1Header() returned:", err)
 		return fmt.Errorf("failed to decode gtp-u header")
 	}
+	
 	switch gtpPdu.Hdr.MsgType {
 	case test.TYPE_GPDU:
 		/* A G-PDU is T-PDU encapsulated with GTP-U header*/

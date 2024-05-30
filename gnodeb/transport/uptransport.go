@@ -12,7 +12,9 @@ import (
 	"github.com/omec-project/gnbsim/common"
 	gnbctx "github.com/omec-project/gnbsim/gnodeb/context"
 	"github.com/omec-project/gnbsim/logger"
+	pdu "github.com/omec-project/gnbsim/realue/worker/pdusessworker"
 	"github.com/omec-project/gnbsim/transportcommon"
+	"github.com/omec-project/gnbsim/util/test"
 	"github.com/sirupsen/logrus"
 )
 
@@ -104,10 +106,69 @@ func (upTprt *GnbUpTransport) ReceiveFromPeer(peer transportcommon.TransportPeer
 			upTprt.Log.Errorln("No UPF Context found corresponding to IP:", srcIp)
 			continue
 		}
+
 		tMsg := &common.TransportMessage{}
 		tMsg.RawPkt = recvMsg[:n]
-		gnbupf.ReadChan <- tMsg
-		upTprt.Log.Traceln("Forwarded UDP packet to UPF Worker")
+		// TODO: Start here @Lincoln
+		/*
+			gnbupf.ReadChan <- tMsg
+		*/
+
+		tMsg := msg.(*common.TransportMessage)
+		gtpPdu, err := test.DecodeGTPv1Header(tMsg.RawPkt)
+		if err != nil {
+			gnbUpf.Log.Errorln("DecodeGTPv1Header() returned:", err)
+			return fmt.Errorf("failed to decode gtp-u header")
+		}
+		switch gtpPdu.Hdr.MsgType {
+		case test.TYPE_GPDU:
+			/* A G-PDU is T-PDU encapsulated with GTP-U header*/
+			gnbUpf.Log.Traceln("Processing downlink G-PDU packet")
+			gnbUpUe := gnbUpf.GnbUpUes.GetGnbUpUe(gtpPdu.Hdr.Teid, true)
+			if gnbUpUe == nil {
+				return nil
+				/* TODO: Send ErrorIndication message to upf*/
+			}
+			msg := &common.N3Message{}
+			msg.Event = common.DL_UE_DATA_TRANSPORT_EVENT
+			msg.Pdu = gtpPdu
+			gnbUpUe.ReadDlChan <- msg
+
+			if err != nil {
+				gnbUpf.Log.Errorln("HandleDlGpduMessage() returned:", err)
+				return fmt.Errorf("failed to handle downling gpdu message")
+			}
+
+			// TODO: Where goes the data come out?
+
+			ueDataMsg := &common.UserDataMessage{}
+			ueDataMsg.Payload = msg.Pdu.Payload
+
+			optHdr := msg.Pdu.OptHdr
+			if optHdr != nil {
+				if optHdr.NextHdrType == test.PDU_SESS_CONTAINER_EXT_HEADER_TYPE {
+					// TODO: Write a generic function to process all the extension
+					// headers and return a map(ext header type - ext headers)
+					// and user data
+					var extHdr *test.PduSessContainerExtHeader
+					ueDataMsg.Payload, extHdr, err = test.DecodePduSessContainerExtHeader(msg.Pdu.Payload)
+					if err != nil {
+						return fmt.Errorf("failed to decode pdu session container extension header:%v", err)
+					}
+					ueDataMsg.Qfi = new(uint8)
+					*ueDataMsg.Qfi = extHdr.Qfi
+					gnbue.Log.Infoln("Received QFI value in downlink G-PDU:", extHdr.Qfi)
+				}
+			}
+
+			ueDataMsg.Event = common.DL_UE_DATA_TRANSFER_EVENT
+
+			gnbue.Log.Infoln("Lincoln: Sent DL user data packet to UE")
+			pdu.HandleDlMessage(nil, ueDataMsg)
+
+			/* TODO: Handle More GTP-PDU types eg. Error Indication */
+		}
+
 	}
 }
 

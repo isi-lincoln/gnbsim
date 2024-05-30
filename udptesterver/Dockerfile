@@ -14,15 +14,14 @@ RUN apt-get update && \
     ethtool \
     iproute2 \
     net-tools \
-    netcat-traditional \
-    ffmpeg \
-    tcpdump \
-    iputils-ping \
     libpcap-dev && \
     apt-get clean
 
-WORKDIR $GOPATH/src/gnbsim
+ARG PORT
+ENV PORT 11000
+
+WORKDIR $GOPATH/src/echo
 COPY . .
 RUN make all
 
-CMD "/bin/sleep 100d"
+CMD ["/bin/sleep", "100d"]

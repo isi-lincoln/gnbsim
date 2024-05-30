@@ -18,11 +18,11 @@ var (
 
 func Init(pduSess *realuectx.PduSession, wg *sync.WaitGroup) {
 	if !locked {
-		locked = true
-		pduSess.Log.Infoln("calling Blah")
 		go func() {
-			Blah(pduSess)
-		}()
+			locked = true
+			pduSess.Log.Infoln("calling Blah")
+                	Blah(pduSess)
+        	}()
 	}
 	HandleEvents(pduSess)
 	wg.Done()
